@@ -2,7 +2,7 @@ import os
 import json
 
 # DB file at root ScreenSmart folder
-DB_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "candidates.json")
+DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "candidates.json")
 
 def load_candidates():
     if os.path.exists(DB_FILE):

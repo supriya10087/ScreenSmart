@@ -10,14 +10,15 @@ Based on the structure, here is a status breakdown of each component and what ha
 ScreenSmart/
 ├── backend/
 │   ├── app.py                 # [COMPLETED] Core Flask routes, local candidate database, sample loader
-│   ├── parser.py              # [COMPLETED] Text extractor from PDF using PyMuPDF (fitz)
-│   ├── gemini_service.py      # [COMPLETED] ATS scoring model using Gemini-3.5-Flash returning structured JSON
-│   └── templates/
-│       ├── about.html         # [COMPLETED] Premium landing page resembling Resume Gyani
-│       ├── index.html         # [COMPLETED] Drag & drop batch uploader (multiple PDF files)
-│       └── dashboard.html     # [COMPLETED] Recruiter dashboard with stats, search, filters & details drawer
+│   ├── resume_parser.py       # [COMPLETED] Text extractor from PDF using PyMuPDF (fitz)
+│   └── utils.py               # [COMPLETED] Helper functions for candidate data management
+├── frontend/                  # [COMPLETED] Frontend UI templates
+│   ├── about.html             # Premium landing page resembling Resume Gyani
+│   ├── index.html             # Drag & drop batch uploader (multiple PDF files)
+│   ├── dashboard.html         # Recruiter dashboard with stats, search, filters & details drawer
+│   └── result.html            # Results display template
 ├── candidates.json            # [COMPLETED] Local JSON persistence database for candidate profiles
-├── uploads/                   # [COMPLETED] Storage folder for Job Descriptions and Resumes
+├── data/                      # [COMPLETED] Storage folder for Job Descriptions and Resumes
 ```
 
 ---

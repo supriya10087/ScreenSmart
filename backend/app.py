@@ -1,28 +1,67 @@
 from flask import Flask, render_template, request, redirect, url_for, jsonify
-from parser import extract_text
-from gemini_service import analyze_resume
-from scheduler import generate_slots
+from resume_parser import extract_text
 from utils import load_candidates, save_candidates
 from dotenv import load_dotenv
-import os
-import json
-import uuid
 import datetime
+import os
+import uuid
+import requests
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import requests
-import re
 
 # Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_FOLDER = os.path.join(BASE_DIR, "frontend")
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+app = Flask(
+    __name__,
+    template_folder=FRONTEND_FOLDER,
+    static_folder=os.path.join(FRONTEND_FOLDER, "static")
+)
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "data")
 os.makedirs(os.path.join(UPLOAD_FOLDER, "resumes"), exist_ok=True)
-os.makedirs(os.path.join(UPLOAD_FOLDER, "jd"), exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+
+def screen_resume_locally(resume_text, jd_text):
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        return None
+    try:
+        from google import genai
+        client = genai.Client(api_key=gemini_key)
+        prompt = (
+            "You are a technical recruiter. Evaluate the candidate resume against the job description and return your assessment strictly as a JSON object.\n\n"
+            "=== JOB DESCRIPTION ===\n" + jd_text + "\n\n"
+            "=== CANDIDATE RESUME ===\n" + resume_text + "\n\n"
+            "Rules:\n"
+            "- Extract candidate_name and email (empty string if none).\n"
+            "- Extract phone number or set 'N/A'.\n"
+            "- Give score 0-100 for JD match.\n"
+            "- tier is strictly one of: 'Strong Fit', 'Possible Fit', 'Not Fit'.\n"
+            "- List matched_skills (list of strings) and missing_skills (list of strings).\n"
+            "- reasoning must cite exactly what matched or is missing.\n"
+            "- recommendation is a short next step for the recruiter.\n\n"
+            "Return JSON with keys: candidate_name, email, phone, score, tier, matched_skills, missing_skills, reasoning, recommendation"
+        )
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt
+        )
+        txt = response.text.strip()
+        if txt.startswith("```"):
+            txt = re.sub(r"^```(?:json)?\s*", "", txt)
+            txt = re.sub(r"\s*```$", "", txt)
+        import json
+        return json.loads(txt)
+    except Exception as e:
+        print(f"Direct Gemini AI screening warning: {e}")
+        return None
 
 
 def extract_email_from_text(text):
@@ -34,12 +73,233 @@ def extract_email_from_text(text):
     return None
 
 
+@app.route("/")
+def home():
+    return render_template("about.html")
+
+
+@app.route("/screener")
+def screener():
+    return render_template("index.html")
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    resumes = request.files.getlist("resume")
+    jd_text = request.form.get("jd_text", "")
+    job_title = request.form.get("job_title", "Backend Developer")
+
+    candidates = load_candidates()
+    n8n_url = os.getenv("N8N_WEBHOOK_URL")
+
+    if not n8n_url:
+        print("Error: N8N_WEBHOOK_URL is not set.")
+        return redirect(url_for("dashboard"))
+
+    # Prepare files and local text cache
+    files = []
+    opened_files = []
+    resume_texts = {}
+    
+    try:
+        for idx, resume in enumerate(resumes):
+            if not resume.filename:
+                continue
+            resume_path = os.path.join(UPLOAD_FOLDER, "resumes", resume.filename)
+            resume.save(resume_path)
+            
+            # Extract text locally for display in the local dashboard drawer if needed
+            try:
+                txt = extract_text(resume_path)
+                resume_texts[resume.filename] = txt
+            except Exception as extract_err:
+                print(f"Local text extraction warning for {resume.filename}: {extract_err}")
+                resume_texts[resume.filename] = ""
+
+            # Prepare binary file for multipart/form-data post to n8n
+            f = open(resume_path, "rb")
+            opened_files.append(f)
+            # Use 'data' prefix or similar key matching n8n binary mapping (any key is fine since Code node gets all file keys)
+            files.append((f"resume_{idx}", (resume.filename, f, "application/pdf")))
+            
+        if files:
+            data = {
+                "job_description": jd_text,
+                "recruiter_name": "ScreenSmart Recruiter",
+                "recruiter_email": "recruiter@example.com"
+            }
+            
+            print(f"Forwarding {len(files)} files to n8n webhook: {n8n_url}")
+            response = requests.post(n8n_url, files=files, data=data, timeout=12)
+            print(f"n8n webhook response code: {response.status_code}")
+            
+            n8n_processed = False
+            if response.status_code == 200:
+                response_data = response.json()
+                data_obj = response_data
+                if isinstance(response_data, list) and len(response_data) > 0:
+                    data_obj = response_data[0]
+                
+                n8n_candidates = data_obj.get("candidates", [])
+                if n8n_candidates:
+                    n8n_processed = True
+                    resume_keys = list(resume_texts.keys())
+                    for idx, candidate in enumerate(n8n_candidates):
+                        candidate_id = str(uuid.uuid4())
+                        matched_skills = candidate.get("matched_skills") or []
+                        missing_skills = candidate.get("missing_skills") or []
+                        reasoning = candidate.get("reasoning", "")
+                        recommendation = candidate.get("recommendation", "")
+                        
+                        rationale_lines = []
+                        if reasoning:
+                            rationale_lines.append(f"✓ AI Reasoning: {reasoning}")
+                        if recommendation:
+                            rationale_lines.append(f"✓ Recommendation: {recommendation}")
+                        for skill in missing_skills:
+                            rationale_lines.append(f"• Missing: {skill}")
+                            
+                        rationale = "\n".join(rationale_lines) if rationale_lines else "No justification provided."
+                        
+                        file_name = candidate.get("file_name", "")
+                        cand_resume_text = resume_texts.get(file_name, "")
+                        if not cand_resume_text and idx < len(resume_keys):
+                            cand_resume_text = resume_texts[resume_keys[idx]]
+
+                        tier = candidate.get("tier") or "Possible Fit"
+                        slots = candidate.get("proposed_slots") or []
+                        if tier == "Strong Fit" and not slots:
+                            today = datetime.date.today()
+                            slots = [
+                                (today + datetime.timedelta(days=1)).strftime("%a, %b %d, %Y at 10:00 AM"),
+                                (today + datetime.timedelta(days=2)).strftime("%a, %b %d, %Y at 02:00 PM"),
+                                (today + datetime.timedelta(days=3)).strftime("%a, %b %d, %Y at 04:00 PM")
+                            ]
+
+                        candidate_data = {
+                            "id": candidate_id,
+                            "name": candidate.get("candidate_name") or os.path.splitext(file_name)[0] or "Unknown Candidate",
+                            "email": candidate.get("email") or "candidate@example.com",
+                            "phone": candidate.get("phone") or "N/A",
+                            "score": candidate.get("score") or 0,
+                            "tier": tier,
+                            "strengths": matched_skills,
+                            "missing_requirements": missing_skills,
+                            "rationale": rationale,
+                            "status": candidate.get("status") or ("Invited" if tier == "Strong Fit" else "Pending"),
+                            "interview_time": candidate.get("interview_time") or "",
+                            "proposed_slots": slots,
+                            "resume_text": cand_resume_text
+                        }
+                        candidates.append(candidate_data)
+                    
+                    save_candidates(candidates)
+                    print(f"Successfully added {len(n8n_candidates)} candidates from n8n response.")
+            else:
+                print(f"n8n webhook returned status {response.status_code}: {response.text}")
+
+            if not n8n_processed and resume_texts:
+                print("n8n webhook did not return candidates. Using Gemini AI screening fallback...")
+                for fname, txt in resume_texts.items():
+                    parsed = screen_resume_locally(txt, jd_text)
+                    candidate_id = str(uuid.uuid4())
+                    if parsed:
+                        matched_skills = parsed.get("matched_skills") or []
+                        missing_skills = parsed.get("missing_skills") or []
+                        reasoning = parsed.get("reasoning", "")
+                        recommendation = parsed.get("recommendation", "")
+                        tier = parsed.get("tier") or "Possible Fit"
+
+                        rationale_lines = []
+                        if reasoning:
+                            rationale_lines.append(f"✓ AI Reasoning: {reasoning}")
+                        if recommendation:
+                            rationale_lines.append(f"✓ Recommendation: {recommendation}")
+                        for skill in missing_skills:
+                            rationale_lines.append(f"• Missing: {skill}")
+                        rationale = "\n".join(rationale_lines) if rationale_lines else "Evaluated by Gemini AI."
+
+                        today = datetime.date.today()
+                        slots = []
+                        if tier == "Strong Fit":
+                            slots = [
+                                (today + datetime.timedelta(days=1)).strftime("%a, %b %d, %Y at 10:00 AM"),
+                                (today + datetime.timedelta(days=2)).strftime("%a, %b %d, %Y at 02:00 PM"),
+                                (today + datetime.timedelta(days=3)).strftime("%a, %b %d, %Y at 04:00 PM")
+                            ]
+
+                        c_email = parsed.get("email") or extract_email_from_text(txt) or "candidate@example.com"
+                        c_name = parsed.get("candidate_name") or os.path.splitext(fname)[0]
+
+                        candidate_data = {
+                            "id": candidate_id,
+                            "name": c_name,
+                            "email": c_email,
+                            "phone": parsed.get("phone") or "N/A",
+                            "score": parsed.get("score") or 0,
+                            "tier": tier,
+                            "strengths": matched_skills,
+                            "missing_requirements": missing_skills,
+                            "rationale": rationale,
+                            "status": "Invited" if tier == "Strong Fit" else "Pending",
+                            "interview_time": "",
+                            "proposed_slots": slots,
+                            "resume_text": txt
+                        }
+                    else:
+                        candidate_data = {
+                            "id": candidate_id,
+                            "name": os.path.splitext(fname)[0],
+                            "email": extract_email_from_text(txt) or "candidate@example.com",
+                            "phone": "N/A",
+                            "score": 0,
+                            "tier": "Not Fit",
+                            "strengths": [],
+                            "missing_requirements": ["AI analysis failed"],
+                            "rationale": "Automated screening fallback failed.",
+                            "status": "Pending",
+                            "interview_time": "",
+                            "proposed_slots": [],
+                            "resume_text": txt
+                        }
+                    candidates.append(candidate_data)
+                save_candidates(candidates)
+                print(f"Fallback added {len(resume_texts)} candidates.")
+                
+    except Exception as e:
+        print(f"Error processing files or contacting n8n webhook: {e}")
+    finally:
+        for f in opened_files:
+            f.close()
+
+    if len(resumes) == 1 and candidates:
+        return redirect(url_for("candidate_dashboard", candidate_id=candidates[-1]["id"]))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/dashboard")
+def dashboard():
+    candidates = load_candidates()
+    candidates_sorted = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
+    return render_template("dashboard.html", candidates=candidates_sorted, selected_candidate_id=None)
+
+
+@app.route("/dashboard/<candidate_id>")
+def candidate_dashboard(candidate_id):
+    candidates = load_candidates()
+    candidates_sorted = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
+    candidate = next((c for c in candidates if c["id"] == candidate_id), None)
+    if not candidate:
+        return "Candidate not found", 404
+    return render_template("dashboard.html", candidates=candidates_sorted, selected_candidate_id=candidate_id)
+
+
 def send_gmail(to_email, subject, body_text):
     sender_email = os.getenv("GMAIL_EMAIL")
     app_password = os.getenv("GMAIL_APP_PASSWORD")
 
     if not sender_email or not app_password or "your-email" in sender_email or "xxxx" in app_password:
-        reason = "Gmail SMTP credentials not configured or using placeholders."
+        reason = "Gmail SMTP credentials not configured or using placeholders in .env."
         print(f"Email failed: {reason}")
         return False, reason
 
@@ -62,153 +322,26 @@ def send_gmail(to_email, subject, body_text):
         return False, str(e)
 
 
-@app.route("/")
-def home():
-    return render_template("about.html")
-
-
-@app.route("/screener")
-def screener():
-    return render_template("index.html")
-
-
-@app.route("/upload", methods=["POST"])
-def upload():
-    resumes = request.files.getlist("resume")
-    jd = request.files["jd"]
-
-    jd_path = os.path.join(UPLOAD_FOLDER, "jd", jd.filename)
-    jd.save(jd_path)
-    jd_text = extract_text(jd_path)
-
-    candidates = load_candidates()
-
-    for resume in resumes:
-        if not resume.filename:
-            continue
-        resume_path = os.path.join(UPLOAD_FOLDER, "resumes", resume.filename)
-        resume.save(resume_path)
-        
-        try:
-            resume_text = extract_text(resume_path)
-            result = analyze_resume(resume_text, jd_text)
-            
-            # Determine Tier based on score rules
-            score = result.get("score") or 0
-            if score >= 85:
-                tier = "Strong Fit"
-            elif score >= 60:
-                tier = "Possible Fit"
-            else:
-                tier = "Not Fit"
-
-            # Determine initial status
-            if tier == "Strong Fit":
-                proposed = generate_slots()
-                status = "Interview Sent"
-                interview_time = ""
-            elif tier == "Possible Fit":
-                proposed = []
-                status = "Pending"
-                interview_time = ""
-            else:
-                proposed = []
-                status = "Rejected"
-                interview_time = ""
-
-            email_to_use = result.get("email") or result.get("candidate_email") or extract_email_from_text(resume_text)
-            if not email_to_use:
-                print("Error: Candidate email address is missing from resume.")
-
-            candidate_id = str(uuid.uuid4())
-            candidate_data = {
-                "id": candidate_id,
-                "name": result.get("name") or result.get("candidate_name") or os.path.splitext(resume.filename)[0],
-                "email": email_to_use or "candidate@example.com",
-                "phone": result.get("phone") or "N/A",
-                "score": score,
-                "tier": tier,
-                "strengths": result.get("strengths") or [],
-                "missing_requirements": result.get("missing_requirements") or [],
-                "rationale": result.get("rationale") or "No justification provided.",
-                "status": status,
-                "interview_time": interview_time,
-                "proposed_slots": proposed,
-                "resume_text": resume_text
-            }
-            candidates.append(candidate_data)
-            save_candidates(candidates)
-
-            if tier == "Strong Fit" and email_to_use:
-                role = "Backend Developer"
-                subject = f"Interview Invitation: {role} - ScreenSmart Recruitment"
-                slots_text = "\n".join([f"📅 {s}" for s in proposed])
-                body = f"Dear {candidate_data['name']},\n\nThank you for your application for the {role} position. We reviewed your resume, and your experience aligns strongly with our Job Description.\n\nWe would like to invite you for an interview. Please reply to this email confirming your preference from the following available slots:\n\n{slots_text}\n\nBest regards,\nRecruitment Team\nScreenSmart Suite"
-                send_gmail(email_to_use, subject, body)
-
-            # Trigger n8n post-analysis automation webhook if URL is present
-            n8n_url = os.getenv("N8N_WEBHOOK_URL")
-            if n8n_url:
-                try:
-                    requests.post(n8n_url, json=candidate_data, timeout=5)
-                    print(f"Triggered n8n post-analysis workflow successfully for {candidate_data['name']}.")
-                except Exception as n8n_err:
-                    print(f"Could not connect to n8n webhook: {n8n_err}")
-
-        except Exception as e:
-            print(f"Error parsing resume {resume.filename}: {e}")
-
-    if len(resumes) == 1 and candidates:
-        return redirect(url_for("candidate_dashboard", candidate_id=candidates[-1]["id"]))
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/dashboard")
-def dashboard():
-    candidates = load_candidates()
-    candidates_sorted = sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
-    return render_template("dashboard.html", candidates=candidates_sorted, single_view=False)
-
-
-@app.route("/dashboard/<candidate_id>")
-def candidate_dashboard(candidate_id):
-    candidates = load_candidates()
-    candidate = next((c for c in candidates if c["id"] == candidate_id), None)
-    if not candidate:
-        return "Candidate not found", 404
-    return render_template("dashboard.html", candidates=[candidate], single_view=True)
-
-
 @app.route("/send_invite", methods=["POST"])
 def send_invite():
     data = request.get_json()
     candidate_id = data.get("id")
-    custom_subject = data.get("subject")
-    custom_body = data.get("body")
+    subject = data.get("subject", "Interview Invitation")
+    body = data.get("body", "")
 
-    if not candidate_id:
-        return jsonify({"success": False, "error": "Missing candidate id"}), 400
+    if not candidate_id or not body:
+        return jsonify({"success": False, "error": "Missing parameters"}), 400
 
     candidates = load_candidates()
     candidate = next((c for c in candidates if c["id"] == candidate_id), None)
     if not candidate:
         return jsonify({"success": False, "error": "Candidate not found"}), 404
 
-    # Build the invitation email with proposed slots
-    role = "Backend Developer"
-    subject = custom_subject or f"Interview Invitation: {role} - ScreenSmart Recruitment"
-    
-    if custom_body:
-        body = custom_body
-    else:
-        slots_text = "\n".join([f"📅 {s}" for s in candidate.get("proposed_slots", [])])
-        body = f"Dear {candidate['name']},\n\nThank you for your application for the {role} position. We reviewed your resume, and your experience aligns strongly with our Job Description.\n\nWe would like to invite you for an interview. Please reply to this email confirming your preference from the following available slots:\n\n{slots_text}\n\nBest regards,\nRecruitment Team\nScreenSmart Suite"
-    
     success, err_msg = send_gmail(candidate["email"], subject, body)
     
     if not success:
-        return jsonify({"success": False, "error": f"Email sending failed: {err_msg}"}), 500
-        
+        return jsonify({"success": False, "error": f"SMTP sending failed: {err_msg}"}), 500
+
     candidate["status"] = "Interview Sent"
     save_candidates(candidates)
     
@@ -231,29 +364,50 @@ def schedule_interview():
             c["status"] = "Interview Scheduled"
             c["interview_time"] = interview_time
             updated = True
-            
-            # Send a real calendar schedule confirmation email!
-            role = "Backend Developer"
-            subject = f"Interview Confirmed: {role} - ScreenSmart"
-            body = f"Dear {c['name']},\n\nYour interview for the {role} position has been scheduled.\n\nDate & Time: {interview_time}\nMeeting Link: https://meet.google.com/abc-defg-hij\n\nBest regards,\nRecruitment Team"
-            send_gmail(c['email'], subject, body)
             break
 
     if updated:
         save_candidates(candidates)
         return jsonify({"success": True})
-    return jsonify({"success": False, "error": "Candidate not found"}), 444
+    return jsonify({"success": False, "error": "Candidate not found"}), 404
 
 
 @app.route("/clear_candidates", methods=["POST"])
 def clear_candidates():
     save_candidates([])
-    return redirect(url_for("home"))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/delete_candidate", methods=["POST"])
+def delete_candidate():
+    data = request.get_json()
+    candidate_id = data.get("id")
+    if not candidate_id:
+        return jsonify({"success": False, "error": "Missing candidate id"}), 400
+        
+    candidates = load_candidates()
+    new_candidates = [c for c in candidates if c["id"] != candidate_id]
+    save_candidates(new_candidates)
+    return jsonify({"success": True})
+
+
+@app.route("/update_candidates_db", methods=["POST"])
+def update_candidates_db():
+    data = request.get_json()
+    if not isinstance(data, list):
+        return jsonify({"success": False, "error": "Expected a list of candidates"}), 400
+    save_candidates(data)
+    return jsonify({"success": True})
 
 
 @app.route("/load_samples", methods=["POST"])
 def load_samples():
-    slots = generate_slots()
+    today = datetime.date.today()
+    slots = [
+        (today + datetime.timedelta(days=1)).strftime("%a, %b %d, %Y at 10:00 AM"),
+        (today + datetime.timedelta(days=2)).strftime("%a, %b %d, %Y at 02:00 PM"),
+        (today + datetime.timedelta(days=3)).strftime("%a, %b %d, %Y at 04:00 PM")
+    ]
     
     samples = [
         {
@@ -488,4 +642,4 @@ def load_samples():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True, use_reloader=False)

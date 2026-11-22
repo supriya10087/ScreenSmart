@@ -6,6 +6,7 @@ ENV/
 # Environment Variables (Sensitive data)
 .env
 .env.*
+!.env.example
 
 # Python Cache
 __pycache__/
